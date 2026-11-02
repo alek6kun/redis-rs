@@ -1457,6 +1457,212 @@ mod cluster_async {
         }
     }
 
+    // A retry that is moved back to the pending queue without requesting any recovery action must
+    // wake the connection task, even if nothing else is in flight.
+    #[test]
+    fn test_async_cluster_retry_completes_when_no_other_request_is_in_flight() {
+        let name = "test_async_cluster_retry_completes_when_no_other_request_is_in_flight";
+        let attempts = AtomicU32::new(0);
+        let MockEnv {
+            async_connection: mut connection,
+            handler: _handler,
+            runtime,
+            ..
+        } = MockEnv::new(name, move |cmd: &[u8], _| {
+            respond_startup(name, cmd)?;
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(Err(
+                    std::io::Error::from(std::io::ErrorKind::Interrupted).into()
+                ))
+            } else {
+                Err(Ok(Value::Okay))
+            }
+        });
+
+        let result = runtime.block_on(async move {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                cmd("GET").arg("test").query_async::<Value>(&mut connection),
+            )
+            .await
+        });
+        assert_eq!(result.unwrap(), Ok(Value::Okay));
+    }
+
+    // The sub-requests of a fan-out are queued while the in-flight requests are being polled, so
+    // they must wake the connection task instead of waiting for an unrelated request to finish.
+    #[test]
+    fn test_async_cluster_fan_out_completes_beside_a_slow_request() {
+        let name = "test_async_cluster_fan_out_completes_beside_a_slow_request";
+        let MockEnv {
+            async_connection: connection,
+            handler: _handler,
+            runtime,
+            ..
+        } = MockEnv::new(name, move |cmd: &[u8], _| {
+            respond_startup(name, cmd)?;
+            Err(Ok(Value::Okay))
+        });
+        add_mock_delay(name, |cmd, _| {
+            if contains_slice(cmd, b"BLPOP") {
+                Duration::from_secs(3600)
+            } else {
+                Duration::ZERO
+            }
+        });
+
+        let result = runtime.block_on(async move {
+            let mut slow_connection = connection.clone();
+            let mut fan_out_connection = connection;
+            let _slow_request = tokio::spawn(async move {
+                cmd("BLPOP")
+                    .arg("test")
+                    .arg(0)
+                    .query_async::<Value>(&mut slow_connection)
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(1)).await;
+
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                fan_out_connection.route_command(
+                    cmd("FLUSHALL"),
+                    RoutingInfo::MultiNode((
+                        MultipleNodeRoutingInfo::AllNodes,
+                        Some(ResponsePolicy::AllSucceeded),
+                    )),
+                ),
+            )
+            .await
+        });
+        assert_eq!(result.unwrap(), Ok(Value::Okay));
+    }
+
+    // A minimal cluster node, listening on `port`, that answers every command with `+OK`, except for:
+    // * `CLUSTER SLOTS`, which it answers with `slots`.
+    // * If `redirect_and_go_silent` is set: commands for `{bar}`, which it answers with that redirect
+    //   and sets `silent`, after which it never answers `CLUSTER SLOTS` again.
+    async fn run_fake_node(
+        listener: tokio::net::TcpListener,
+        slots: Arc<[u8]>,
+        silent: Arc<AtomicBool>,
+        redirect_and_go_silent: Option<Arc<[u8]>>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+        while let Ok((stream, _)) = listener.accept().await {
+            let (slots, silent) = (slots.clone(), silent.clone());
+            let redirect = redirect_and_go_silent.clone();
+            tokio::spawn(async move {
+                let mut stream = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let args: usize = line.trim()[1..].parse().unwrap();
+                    let mut command = Vec::new();
+                    for _ in 0..args {
+                        line.clear();
+                        stream.read_line(&mut line).await.unwrap();
+                        let len: usize = line.trim()[1..].parse().unwrap();
+                        let mut arg = vec![0; len + 2];
+                        stream.read_exact(&mut arg).await.unwrap();
+                        command.extend_from_slice(&arg);
+                    }
+
+                    let reply: Vec<u8> = if contains_slice(&command, b"SLOTS") {
+                        if redirect.is_some() && silent.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        slots.to_vec()
+                    } else if let Some(redirect) = redirect
+                        .as_ref()
+                        .filter(|_| contains_slice(&command, b"{bar}"))
+                    {
+                        silent.store(true, Ordering::SeqCst);
+                        redirect.to_vec()
+                    } else {
+                        b"+OK\r\n".to_vec()
+                    };
+                    if stream.get_mut().write_all(&reply).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
+    // A node that stops responding during a slot refresh must not block the connection forever, even
+    // if the user configured no timeouts: the refresh holds the connection lock, and no other
+    // request is handled until it completes. The refresh queries the nodes in a random order, and
+    // only blocks if it reaches the unresponsive node first, so this runs several times.
+    #[cfg(feature = "tokio-comp")]
+    #[tokio::test]
+    async fn test_async_cluster_unresponsive_node_does_not_block_slot_refresh_by_default() {
+        for attempt in 0..10 {
+            let silent_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let healthy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let silent_port = silent_listener.local_addr().unwrap().port();
+            let healthy_port = healthy_listener.local_addr().unwrap().port();
+
+            let node = |port: u16| format!("*2\r\n$9\r\n127.0.0.1\r\n:{port}\r\n");
+            let slots: Arc<[u8]> = Arc::from(
+                format!(
+                    "*2\r\n*3\r\n:0\r\n:8191\r\n{}*3\r\n:8192\r\n:16383\r\n{}",
+                    node(silent_port),
+                    node(healthy_port)
+                )
+                .into_bytes(),
+            );
+            let silent = Arc::new(AtomicBool::new(false));
+            let redirect: Arc<[u8]> =
+                Arc::from(format!("-MOVED 5061 127.0.0.1:{healthy_port}\r\n").into_bytes());
+            let silent_node = tokio::spawn(run_fake_node(
+                silent_listener,
+                slots.clone(),
+                silent.clone(),
+                Some(redirect),
+            ));
+            let healthy_node =
+                tokio::spawn(run_fake_node(healthy_listener, slots, silent.clone(), None));
+
+            let client =
+                ClusterClient::new(vec![format!("redis://127.0.0.1:{healthy_port}/")]).unwrap();
+            let mut connection = client.get_async_connection().await.unwrap();
+
+            // {bar} is served by the node that goes silent. Its MOVED response starts the refresh.
+            let mut redirected_connection = connection.clone();
+            tokio::spawn(async move {
+                let _ = cmd("GET")
+                    .arg("{bar}")
+                    .query_async::<Value>(&mut redirected_connection)
+                    .await;
+            });
+            while !silent.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+
+            // {foo} is served by the healthy node, so it succeeds as soon as the refresh is done.
+            let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+                while cmd("GET")
+                    .arg("{foo}")
+                    .query_async::<Value>(&mut connection)
+                    .await
+                    .is_err()
+                {}
+            })
+            .await;
+            silent_node.abort();
+            healthy_node.abort();
+            assert!(
+                recovered.is_ok(),
+                "attempt {attempt}: the unresponsive node blocked the connection"
+            );
+        }
+    }
+
     #[test]
     fn test_async_cluster_reset_routing_if_redirect_fails() {
         let name = "test_async_cluster_reset_routing_if_redirect_fails";

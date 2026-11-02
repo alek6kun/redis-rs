@@ -217,6 +217,12 @@ pub(crate) fn choose_response<C>(
     let sleep_duration = retry_params.wait_time_for_retry(request.retry);
 
     match (target, err.retry_method()) {
+        // The command may still run on the node, so it isn't sent again.
+        (OperationTarget::Node { .. }, _) if err.is_timeout() => {
+            request.sender.send(Err(err));
+            (None, PollFlushAction::None)
+        }
+
         (_, RetryMethod::ReconnectFromInitialConnections) => {
             let retry = retry_or_send!(|mut request: PendingRequest<C>| {
                 request.cmd.reset_routing();
@@ -483,6 +489,30 @@ mod tests {
 
         assert_eq!(receiver.try_recv(), Ok(Err(to_err(err_string))));
         assert!(retry.is_none());
+        assert_eq!(next, PollFlushAction::RebuildSlots);
+    }
+
+    #[test]
+    fn never_retry_on_response_timeout() {
+        let (request, mut receiver) = request_and_receiver(0);
+        let err = RedisError::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let result = (OperationTarget::Node { address: ADDRESS }, Err(err));
+        let (retry, next) = choose_response(result, request, &RetryParams::default());
+
+        assert!(receiver.try_recv().unwrap().unwrap_err().is_timeout());
+        assert!(retry.is_none());
+        assert_eq!(next, PollFlushAction::None);
+    }
+
+    #[test]
+    fn retry_on_timeout_before_reaching_a_node() {
+        let (request, mut receiver) = request_and_receiver(0);
+        let err = RedisError::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let result = (OperationTarget::NotFound, Err(err));
+        let (retry, next) = choose_response(result, request, &RetryParams::default());
+
+        assert_matches!(receiver.try_recv(), Err(_));
+        assert!(matches!(retry, Some(super::Retry::AfterSleep { .. })));
         assert_eq!(next, PollFlushAction::RebuildSlots);
     }
 

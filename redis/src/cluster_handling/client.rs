@@ -392,7 +392,9 @@ impl ClusterParams {
         if let Some(connection_timeout) = config.connection_timeout {
             self.connection_timeout = connection_timeout;
         }
-        self.response_timeout = config.response_timeout;
+        if let Some(response_timeout) = config.response_timeout {
+            self.response_timeout = Some(response_timeout);
+        }
 
         #[cfg(feature = "cluster-async")]
         if let Some(async_push_sender) = config.async_push_sender {
@@ -724,6 +726,12 @@ impl ClusterClientBuilder {
     /// If enabled, the cluster will only wait the given time to each response from each node.
     /// This timeout is also used as the overall response timeout (including retries) unless
     /// overridden with [`Self::overall_response_timeout`].
+    ///
+    /// If this isn't called, async connections use the default response timeout, and sync
+    /// connections wait indefinitely. Commands that may take longer, such as blocking commands,
+    /// need a longer timeout.
+    ///
+    /// A command that times out isn't sent again, since it may still run on the node.
     pub fn response_timeout(mut self, response_timeout: Duration) -> Self {
         self.builder_params.response_timeout = Some(response_timeout);
         self
@@ -732,9 +740,10 @@ impl ClusterClientBuilder {
     /// Sets the overall timeout for a complete cluster request, including all retries,
     /// reconnections, and redirections (e.g. MOVED/ASK).
     ///
-    /// By default this matches `response_timeout`, meaning the same duration is used both
-    /// per-attempt and overall. This can cause requests to time out when retries are needed,
-    /// since the retry must complete within whatever time remains from the original timeout.
+    /// By default this matches a `response_timeout` set with [`Self::response_timeout`], meaning
+    /// the same duration is used both per-attempt and overall. This can cause requests to time out
+    /// when retries are needed, since the retry must complete within whatever time remains from
+    /// the original timeout. If `response_timeout` isn't set, there is no overall timeout.
     ///
     /// Set to `None` to disable the overall response timeout. Each individual attempt will
     /// still be bounded by `response_timeout`, but the total operation can take longer when
@@ -1289,6 +1298,39 @@ mod tests {
             result.unwrap_err(),
             "Cannot use different database among initial nodes.",
         );
+    }
+
+    #[test]
+    fn default_cluster_config_keeps_the_response_timeout() {
+        let client = ClusterClientBuilder::new(get_connection_data())
+            .response_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let params = client.cluster_params.with_config(Default::default());
+        assert_eq!(params.response_timeout, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn cluster_config_response_timeout_replaces_the_builder_value() {
+        let client = ClusterClientBuilder::new(get_connection_data())
+            .response_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let config =
+            crate::cluster::ClusterConfig::default().set_response_timeout(Duration::from_secs(7));
+        let params = client.cluster_params.with_config(config);
+        assert_eq!(params.response_timeout, Some(Duration::from_secs(7)));
+    }
+
+    #[cfg(feature = "cluster-async")]
+    #[test]
+    fn overall_response_timeout_is_unset_without_a_response_timeout() {
+        let client = ClusterClientBuilder::new(get_connection_data())
+            .build()
+            .unwrap();
+        // The default response timeout of async connections is shorter than the default wait
+        // between retries, so it can't be the overall timeout as well.
+        assert_eq!(client.cluster_params.overall_response_timeout, None);
     }
 
     #[cfg(feature = "cluster-async")]

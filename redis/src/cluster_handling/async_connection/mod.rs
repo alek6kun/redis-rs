@@ -1526,14 +1526,10 @@ where
         }
     }
 
-    fn dispatch_pending(&mut self) {
-        loop {
-            let request = match self.pending_requests_rx.try_recv() {
-                Ok(request) => request,
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-            };
-
+    fn dispatch_pending(&mut self, cx: &mut task::Context<'_>) {
+        // `poll_recv` registers the waker when the queue is empty, so that requests queued later
+        // wake the task instead of being stranded.
+        while let Poll::Ready(Some(request)) = self.pending_requests_rx.poll_recv(cx) {
             // Drop the request if no-one is waiting for a response to free up resources for
             // requests callers care about (load shedding). It will be ambiguous whether the
             // request actually goes through regardless.
@@ -1573,7 +1569,7 @@ where
     }
 
     fn poll_complete(&mut self, cx: &mut task::Context<'_>) -> Poll<PollFlushAction> {
-        self.dispatch_pending();
+        self.dispatch_pending(cx);
         self.poll_in_flight(cx)
     }
 
@@ -1841,7 +1837,12 @@ where
     let info = get_connection_info(node, params);
     let mut config =
         AsyncConnectionConfig::default().set_connection_timeout(Some(params.connection_timeout));
-    config = config.set_response_timeout(params.response_timeout);
+    // Keep the config's default if no timeout was set: the slot refresh holds the connection lock
+    // while it waits for responses, so without a timeout a node that stops responding would block
+    // every request on the connection.
+    if let Some(response_timeout) = params.response_timeout {
+        config = config.set_response_timeout(Some(response_timeout));
+    }
 
     if let Some(subscription_tracker) = subscription_tracker {
         config = config.set_subscription_tracker_internal(subscription_tracker);
